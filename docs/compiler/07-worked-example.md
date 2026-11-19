@@ -132,19 +132,57 @@ Propagate known shapes forward: `transpose` of `2x3` gives `3x2`; `mul` of
 
 ### Stage 6 [Middle-end]: Canonicalize + CSE + DCE
 
-Several small rewrites, run until nothing changes (fixed point):
+Several small rewrites, run until nothing changes (fixed point). A real
+driver interleaves them, but it is easier to follow one at a time. Starting
+point (the IR after shape inference, 12 ops):
 
-1. **Reshape folding**: `reshape` of a constant to a new shape becomes just a
-   constant of that shape. `%1`, `%3` vanish; `%2` becomes
-   `dense<[[1,2,3],[4,5,6]]> : tensor<2x3xf64>`.
-2. **CSE**: now `a` and `b` are the *identical* constant, so the constants
-   are merged, and `transpose(a)` and `transpose(b)` are merged, since they
-   are the same op on the same value.
-3. **DCE**: `c` (`%6`) is never used and `mul`/`transpose` are `Pure`, so
-   they are deleted.
-4. Because both operands of `mul` are now the same value, it reads `x * x`.
+```mlir
+toy.func @main() {
+  %0 = toy.constant dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]> : tensor<2x3xf64>
+  %1 = toy.reshape(%0 : tensor<2x3xf64>) to tensor<2x3xf64>
+  %2 = toy.constant dense<[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]> : tensor<6xf64>
+  %3 = toy.reshape(%2 : tensor<6xf64>) to tensor<2x3xf64>
+  %4 = toy.transpose(%1 : tensor<2x3xf64>) to tensor<3x2xf64>   // c
+  %5 = toy.transpose(%3 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %6 = toy.mul %4, %5 : tensor<3x2xf64>
+  %7 = toy.transpose(%3 : tensor<2x3xf64>) to tensor<3x2xf64>   // d
+  %8 = toy.transpose(%1 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %9 = toy.mul %7, %8 : tensor<3x2xf64>
+  toy.print %9 : tensor<3x2xf64>
+  toy.return
+}
+```
 
-Result, a lot smaller than what the frontend emitted:
+**6a. Reshape folding (canonicalization).** Two patterns fire:
+- `reshape` to the *same* type is a no-op, so `%1` is replaced by `%0`.
+- `reshape` of a constant becomes a constant of the new shape, so `%3`
+  becomes `dense<[[1,2,3],[4,5,6]]> : tensor<2x3xf64>`.
+
+The old 6-element constant `%2` is now unused (and pure), so it is deleted.
+10 ops:
+
+```mlir
+toy.func @main() {
+  %0 = toy.constant dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]> : tensor<2x3xf64>   // a
+  %1 = toy.constant dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]> : tensor<2x3xf64>   // b (same value!)
+  %2 = toy.transpose(%0 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %3 = toy.transpose(%1 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %4 = toy.mul %2, %3 : tensor<3x2xf64>                                          // c
+  %5 = toy.transpose(%1 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %6 = toy.transpose(%0 : tensor<2x3xf64>) to tensor<3x2xf64>
+  %7 = toy.mul %5, %6 : tensor<3x2xf64>                                          // d
+  toy.print %7 : tensor<3x2xf64>
+  toy.return
+}
+```
+
+**6b. CSE.** Work top to bottom, merging identical pure ops (same op, same
+operands, same attributes):
+1. `%1` is the same constant as `%0`: merge. Uses of `%1` now point to `%0`.
+2. `%3` is now `transpose(%0)`, same as `%2`: merge. Likewise `%5` and `%6`.
+3. `%4` is now `mul %2, %2` and `%7` is `mul %2, %2`: merge.
+
+5 ops:
 
 ```mlir
 toy.func @main() {
@@ -155,6 +193,23 @@ toy.func @main() {
   toy.return
 }
 ```
+
+**6c. DCE.** Nothing left to delete here, because CSE already removed the
+duplicates. If `a` and `b` had *different* values, `c` would not merge with
+`d`; it would stay as an unused `mul`, and DCE would delete it (pure, no
+uses). Either way the end state is the same, only the pass that gets the
+credit changes.
+
+Result: **12 ops down to 5**, from three one-line rewrite rules:
+
+| After | Ops in `@main` |
+|---|---|
+| Stage 3 (MLIRGen, calls not inlined) | 8 |
+| Stage 4 (inlining) | 12 |
+| Stage 5 (shape inference) | 12 |
+| 6a (reshape folding) | 10 |
+| 6b (CSE) | 5 |
+
 This is why the IR is high-level: these were 1-line pattern rewrites. After
 loops are generated you could not easily see "this is a transpose".
 

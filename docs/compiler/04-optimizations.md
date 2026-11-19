@@ -312,6 +312,81 @@ patterns, plus trivial DCE, and runs them to a fixed point.
 Key requirement: every rewrite must preserve the program's meaning, which is
 why ops declare whether they have side effects.
 
+## Beyond the basics: other major optimizations
+
+The sections above cover the foundational ones. Real compilers (LLVM has
+hundreds of passes) also use the following. You don't need to memorize them;
+know that they exist and what problem each solves.
+
+### Scalar and general-purpose
+
+| Optimization | Idea | Example |
+|---|---|---|
+| **GVN** (global value numbering) | CSE's stronger cousin: gives equal values the same number, even across blocks and when written differently | `a+b` and `b+a`, or a value copied through a variable |
+| **Copy propagation** | after `y = x`, use `x` instead of `y` | `y = x; z = y + 1` -> `z = x + 1` |
+| **SCCP** (sparse conditional constant propagation) | constant propagation that also learns which branches can never run | `if (3 > 5) {...}` -> block removed |
+| **Strength reduction** | replace an expensive op with a cheaper one | `x * 2` -> `x << 1`, `x / 4` -> `x >> 2` |
+| **Reassociation** | reorder operations to expose constants and CSE | `(a + 1) + 2` -> `a + 3` |
+| **Instruction combining** | peephole rules over a few instructions | `(x << 2) >> 2` with known bits -> `x & mask` |
+| **mem2reg / SROA** | turn stack variables into SSA values (registers) | makes SSA usable for C-like code with local variables |
+| **PRE** (partial redundancy elimination) | a value is computed on some paths but not others; make it available on all | CSE for a value computed only in the `then` branch |
+| **Tail call optimization** | reuse the stack frame for a call in tail position | turns deep recursion into a loop |
+| **Function specialization / cloning** | make a copy of a function tuned to a known argument | call with constant `n` gets its own optimized body |
+| **Devirtualization** | turn an indirect/virtual call into a direct one when the target is known | enables inlining |
+| **Escape analysis** | prove an object never leaves the function, so it can live on the stack | removes a heap allocation |
+| **Bounds-check elimination** | drop array checks that provably can't fail | `for i in 0..n: a[i]` needs no check if `len(a) >= n` |
+
+### Control-flow optimizations
+
+- **CFG simplification (SimplifyCFG)**: merge blocks, remove empty ones,
+  delete unreachable code.
+- **Jump threading**: if a branch's outcome is known on some incoming path,
+  jump straight to the right target.
+- **If-conversion / select**: replace a small branch with a conditional-move
+  (`select`). Avoids branch misprediction; essential on GPUs.
+- **Branch folding**: remove a branch whose condition is a known constant.
+
+### Loop optimizations (more)
+
+- **Induction variable simplification**: rewrite loop counters into a simpler
+  form (e.g. replace `i * 4` with a variable that increases by 4).
+- **Loop interchange**: swap nested loops so memory is accessed
+  contiguously.
+- **Loop fission**: split one loop into several (can enable vectorization).
+- **Loop peeling**: pull the first or last iteration out of the loop.
+- **Loop unswitching**: move a loop-invariant `if` outside the loop.
+- **Vectorization**: use SIMD to process several elements per instruction.
+  Often the single biggest win for numeric code.
+- **Software pipelining**: overlap different iterations to hide latency.
+
+### Backend (after lowering)
+
+- **Instruction selection**: choose the best machine instructions for the IR.
+- **Instruction scheduling**: reorder instructions to hide latency.
+- **Register allocation**: decide which values stay in registers and which
+  spill to memory. One of the most impactful passes.
+- **Machine peephole optimization**: small patterns on real instructions.
+
+### ML and GPU kernels (most relevant to this project)
+
+- **Operator fusion**: merge `matmul + bias + relu` into one kernel so the
+  intermediate tensors never touch memory. Usually the biggest win.
+- **Tiling for the memory hierarchy**: block the computation for cache,
+  shared memory and registers.
+- **Memory layout transformation**: choose row-major, blocked, or NHWC
+  layouts that match the hardware.
+- **Bufferization**: convert tensors (values) to memory buffers, reusing
+  buffers when lifetimes don't overlap.
+- **Quantization and mixed precision**: use lower-precision numbers where
+  accuracy allows.
+- **Async copies and software pipelining**: load the next tile while
+  computing the current one.
+- **Memory coalescing and bank-conflict avoidance** on GPUs.
+
+Rule of thumb: for scalar code, the biggest wins are inlining, mem2reg,
+GVN/CSE, and vectorization. For ML and LLM kernels, they are fusion, tiling and
+memory layout.
+
 ## Where it gets hard
 
 - **Side effects and memory.** Two `load`s of the same address may return
